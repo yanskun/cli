@@ -11,18 +11,22 @@ import (
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/context"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/pr/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/context"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
+	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
+
+type browser interface {
+	Browse(string) error
+}
 
 type CreateOptions struct {
 	// This struct stores user input and factory functions
@@ -31,6 +35,8 @@ type CreateOptions struct {
 	IO         *iostreams.IOStreams
 	Remotes    func() (context.Remotes, error)
 	Branch     func() (string, error)
+	Browser    browser
+	Finder     shared.PRFinder
 
 	TitleProvided bool
 	BodyProvided  bool
@@ -79,25 +85,31 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 		Config:     f.Config,
 		Remotes:    f.Remotes,
 		Branch:     f.Branch,
+		Browser:    f.Browser,
 	}
+
+	var bodyFile string
 
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a pull request",
-		Long: heredoc.Doc(`
+		Long: heredoc.Docf(`
 			Create a pull request on GitHub.
 
 			When the current branch isn't fully pushed to a git remote, a prompt will ask where
-			to push the branch and offer an option to fork the base repository. Use '--head' to
+			to push the branch and offer an option to fork the base repository. Use %[1]s--head%[1]s to
 			explicitly skip any forking or pushing behavior.
 
-			A prompt will also ask for the title and the body of the pull request. Use '--title'
-			and '--body' to skip this, or use '--fill' to autofill these values from git commits.
+			A prompt will also ask for the title and the body of the pull request. Use %[1]s--title%[1]s
+			and %[1]s--body%[1]s to skip this, or use %[1]s--fill%[1]s to autofill these values from git commits.
 
-			By default users with write access to the base respository can add new commits to your branch.
-			If undesired, you may disable access of maintainers by using '--no-maintainer-edit'
-			You can always change this setting later via the web interface.
-		`),
+			Link an issue to the pull request by referencing the issue in the body of the pull
+			request. If the body text mentions %[1]sFixes #123%[1]s or %[1]sCloses #123%[1]s, the referenced issue
+			will automatically get closed when the pull request gets merged.
+
+			By default, users with write access to the base repository can push new commits to the
+			head branch of the pull request. Disable this with %[1]s--no-maintainer-edit%[1]s.
+		`, "`"),
 		Example: heredoc.Doc(`
 			$ gh pr create --title "The bug is fixed" --body "Everything works again"
 			$ gh pr create --reviewer monalisa,hubot  --reviewer myorg/team-name
@@ -106,28 +118,39 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 		`),
 		Args: cmdutil.NoArgsQuoteReminder,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.Finder = shared.NewFinder(f)
+
 			opts.TitleProvided = cmd.Flags().Changed("title")
-			opts.BodyProvided = cmd.Flags().Changed("body")
 			opts.RepoOverride, _ = cmd.Flags().GetString("repo")
 			noMaintainerEdit, _ := cmd.Flags().GetBool("no-maintainer-edit")
 			opts.MaintainerCanModify = !noMaintainerEdit
 
 			if !opts.IO.CanPrompt() && opts.RecoverFile != "" {
-				return &cmdutil.FlagError{Err: errors.New("--recover only supported when running interactively")}
+				return cmdutil.FlagErrorf("`--recover` only supported when running interactively")
 			}
 
 			if !opts.IO.CanPrompt() && !opts.WebMode && !opts.TitleProvided && !opts.Autofill {
-				return &cmdutil.FlagError{Err: errors.New("--title or --fill required when not running interactively")}
+				return cmdutil.FlagErrorf("`--title` or `--fill` required when not running interactively")
 			}
 
 			if opts.IsDraft && opts.WebMode {
-				return errors.New("the --draft flag is not supported with --web")
+				return errors.New("the `--draft` flag is not supported with `--web`")
 			}
 			if len(opts.Reviewers) > 0 && opts.WebMode {
-				return errors.New("the --reviewer flag is not supported with --web")
+				return errors.New("the `--reviewer` flag is not supported with `--web`")
 			}
 			if cmd.Flags().Changed("no-maintainer-edit") && opts.WebMode {
-				return errors.New("the --no-maintainer-edit flag is not supported with --web")
+				return errors.New("the `--no-maintainer-edit` flag is not supported with `--web`")
+			}
+
+			opts.BodyProvided = cmd.Flags().Changed("body")
+			if bodyFile != "" {
+				b, err := cmdutil.ReadFile(bodyFile, opts.IO.In)
+				if err != nil {
+					return err
+				}
+				opts.Body = string(b)
+				opts.BodyProvided = true
 			}
 
 			if runF != nil {
@@ -141,6 +164,7 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	fl.BoolVarP(&opts.IsDraft, "draft", "d", false, "Mark pull request as a draft")
 	fl.StringVarP(&opts.Title, "title", "t", "", "Title for the pull request")
 	fl.StringVarP(&opts.Body, "body", "b", "", "Body for the pull request")
+	fl.StringVarP(&bodyFile, "body-file", "F", "", "Read body text from `file`")
 	fl.StringVarP(&opts.BaseBranch, "base", "B", "", "The `branch` into which you want your code merged")
 	fl.StringVarP(&opts.HeadBranch, "head", "H", "", "The `branch` that contains commits for your pull request (default: current branch)")
 	fl.BoolVarP(&opts.WebMode, "web", "w", false, "Open the web browser to create a pull request")
@@ -169,6 +193,8 @@ func createRun(opts *CreateOptions) (err error) {
 		return
 	}
 
+	var openURL string
+
 	if opts.WebMode {
 		if !opts.Autofill {
 			state.Title = opts.Title
@@ -178,7 +204,15 @@ func createRun(opts *CreateOptions) (err error) {
 		if err != nil {
 			return
 		}
-		return previewPR(*opts, *ctx, *state)
+		openURL, err = generateCompareURL(*ctx, *state)
+		if err != nil {
+			return
+		}
+		if !utils.ValidURL(openURL) {
+			err = fmt.Errorf("cannot open in browser: maximum URL length exceeded")
+			return
+		}
+		return previewPR(*opts, openURL)
 	}
 
 	if opts.TitleProvided {
@@ -189,9 +223,13 @@ func createRun(opts *CreateOptions) (err error) {
 		state.Body = opts.Body
 	}
 
-	existingPR, err := api.PullRequestForBranch(
-		client, ctx.BaseRepo, ctx.BaseBranch, ctx.HeadBranchLabel, []string{"OPEN"})
-	var notFound *api.NotFoundError
+	existingPR, _, err := opts.Finder.Find(shared.FindOptions{
+		Selector:   ctx.HeadBranchLabel,
+		BaseBranch: ctx.BaseBranch,
+		States:     []string{"OPEN"},
+		Fields:     []string{"url"},
+	})
+	var notFound *shared.NotFoundError
 	if err != nil && !errors.As(err, &notFound) {
 		return fmt.Errorf("error checking for existing pull request: %w", err)
 	}
@@ -243,14 +281,20 @@ func createRun(opts *CreateOptions) (err error) {
 
 	defer shared.PreserveInput(opts.IO, state, &err)()
 
-	templateContent := ""
 	if !opts.BodyProvided {
+		templateContent := ""
 		if opts.RecoverFile == "" {
-			templateFiles, legacyTemplate := shared.FindTemplates(opts.RootDirOverride, "PULL_REQUEST_TEMPLATE")
-
-			templateContent, err = shared.TemplateSurvey(templateFiles, legacyTemplate, *state)
+			tpl := shared.NewTemplateManager(client.HTTP(), ctx.BaseRepo, opts.RootDirOverride, opts.RepoOverride == "", true)
+			var template shared.Template
+			template, err = tpl.Choose()
 			if err != nil {
 				return
+			}
+
+			if template != nil {
+				templateContent = string(template.Body())
+			} else {
+				templateContent = string(tpl.LegacyBody())
 			}
 		}
 
@@ -258,14 +302,16 @@ func createRun(opts *CreateOptions) (err error) {
 		if err != nil {
 			return
 		}
-
-		if state.Body == "" {
-			state.Body = templateContent
-		}
 	}
 
+	openURL, err = generateCompareURL(*ctx, *state)
+	if err != nil {
+		return
+	}
+
+	allowPreview := !state.HasMetadata() && utils.ValidURL(openURL)
 	allowMetadata := ctx.BaseRepo.ViewerCanTriage()
-	action, err := shared.ConfirmSubmission(!state.HasMetadata(), allowMetadata)
+	action, err := shared.ConfirmSubmission(allowPreview, allowMetadata)
 	if err != nil {
 		return fmt.Errorf("unable to confirm: %w", err)
 	}
@@ -290,7 +336,8 @@ func createRun(opts *CreateOptions) (err error) {
 
 	if action == shared.CancelAction {
 		fmt.Fprintln(opts.IO.ErrOut, "Discarding.")
-		return nil
+		err = cmdutil.CancelError
+		return
 	}
 
 	err = handlePush(*opts, *ctx)
@@ -299,7 +346,7 @@ func createRun(opts *CreateOptions) (err error) {
 	}
 
 	if action == shared.PreviewAction {
-		return previewPR(*opts, *ctx, *state)
+		return previewPR(*opts, openURL)
 	}
 
 	if action == shared.SubmitAction {
@@ -532,7 +579,7 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 		} else if pushOptions[selectedOption] == "Skip pushing the branch" {
 			isPushEnabled = false
 		} else if pushOptions[selectedOption] == "Cancel" {
-			return nil, cmdutil.SilentError
+			return nil, cmdutil.CancelError
 		} else {
 			// "Create a fork of ..."
 			if baseRepo.IsPrivate {
@@ -611,16 +658,11 @@ func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataS
 	return nil
 }
 
-func previewPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataState) error {
-	openURL, err := generateCompareURL(ctx, state)
-	if err != nil {
-		return err
-	}
-
+func previewPR(opts CreateOptions, openURL string) error {
 	if opts.IO.IsStdinTTY() && opts.IO.IsStdoutTTY() {
 		fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(openURL))
 	}
-	return utils.OpenInBrowser(openURL)
+	return opts.Browser.Browse(openURL)
 
 }
 
@@ -635,7 +677,7 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 	// one by forking the base repository
 	if headRepo == nil && ctx.IsPushEnabled {
 		opts.IO.StartProgressIndicator()
-		headRepo, err = api.ForkRepo(client, ctx.BaseRepo)
+		headRepo, err = api.ForkRepo(client, ctx.BaseRepo, "")
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return fmt.Errorf("error forking repo: %w", err)
@@ -714,7 +756,7 @@ func generateCompareURL(ctx CreateContext, state shared.IssueMetadataState) (str
 		ctx.BaseRepo,
 		"compare/%s...%s?expand=1",
 		url.QueryEscape(ctx.BaseBranch), url.QueryEscape(ctx.HeadBranchLabel))
-	url, err := shared.WithPrAndIssueQueryParams(u, state)
+	url, err := shared.WithPrAndIssueQueryParams(ctx.Client, ctx.BaseRepo, u, state)
 	if err != nil {
 		return "", err
 	}

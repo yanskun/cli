@@ -6,8 +6,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/markdown"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/markdown"
 	"github.com/spf13/cobra"
 )
 
@@ -20,7 +20,7 @@ func referenceHelpFn(io *iostreams.IOStreams) func(*cobra.Command, []string) {
 			style = markdown.GetStyle(io.DetectTerminalTheme())
 		}
 
-		md, err := markdown.RenderWrap(cmd.Long, style, wrapWidth)
+		md, err := markdown.RenderWithWrap(cmd.Long, style, wrapWidth)
 		if err != nil {
 			fmt.Fprintln(io.ErrOut, err)
 			return

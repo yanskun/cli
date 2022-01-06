@@ -6,9 +6,30 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/httpmock"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/httpmock"
 )
+
+func TestGitHubRepo_notFound(t *testing.T) {
+	httpReg := &httpmock.Registry{}
+	defer httpReg.Verify(t)
+
+	httpReg.Register(
+		httpmock.GraphQL(`query RepositoryInfo\b`),
+		httpmock.StringResponse(`{ "data": { "repository": null } }`))
+
+	client := NewClient(ReplaceTripper(httpReg))
+	repo, err := GitHubRepo(client, ghrepo.New("OWNER", "REPO"))
+	if err == nil {
+		t.Fatal("GitHubRepo did not return an error")
+	}
+	if wants := "GraphQL: Could not resolve to a Repository with the name 'OWNER/REPO'."; err.Error() != wants {
+		t.Errorf("GitHubRepo error: want %q, got %q", wants, err.Error())
+	}
+	if repo != nil {
+		t.Errorf("GitHubRepo: expected nil repo, got %v", repo)
+	}
+}
 
 func Test_RepoMetadata(t *testing.T) {
 	http := &httpmock.Registry{}
@@ -138,6 +159,63 @@ func Test_RepoMetadata(t *testing.T) {
 	}
 	if milestoneID != expectedMilestoneID {
 		t.Errorf("expected milestone %v, got %v", expectedMilestoneID, milestoneID)
+	}
+}
+
+func Test_ProjectsToPaths(t *testing.T) {
+	expectedProjectPaths := []string{"OWNER/REPO/PROJECT_NUMBER", "ORG/PROJECT_NUMBER"}
+	projects := []RepoProject{
+		{ID: "id1", Name: "My Project", ResourcePath: "/OWNER/REPO/projects/PROJECT_NUMBER"},
+		{ID: "id2", Name: "Org Project", ResourcePath: "/orgs/ORG/projects/PROJECT_NUMBER"},
+		{ID: "id3", Name: "Project", ResourcePath: "/orgs/ORG/projects/PROJECT_NUMBER_2"},
+	}
+	projectNames := []string{"My Project", "Org Project"}
+
+	projectPaths, err := ProjectsToPaths(projects, projectNames)
+	if err != nil {
+		t.Errorf("error resolving projects: %v", err)
+	}
+	if !sliceEqual(projectPaths, expectedProjectPaths) {
+		t.Errorf("expected projects %v, got %v", expectedProjectPaths, projectPaths)
+	}
+}
+
+func Test_ProjectNamesToPaths(t *testing.T) {
+	http := &httpmock.Registry{}
+	client := NewClient(ReplaceTripper(http))
+
+	repo, _ := ghrepo.FromFullName("OWNER/REPO")
+
+	http.Register(
+		httpmock.GraphQL(`query RepositoryProjectList\b`),
+		httpmock.StringResponse(`
+		{ "data": { "repository": { "projects": {
+			"nodes": [
+				{ "name": "Cleanup", "id": "CLEANUPID", "resourcePath": "/OWNER/REPO/projects/1" },
+				{ "name": "Roadmap", "id": "ROADMAPID", "resourcePath": "/OWNER/REPO/projects/2" }
+			],
+			"pageInfo": { "hasNextPage": false }
+		} } } }
+		`))
+	http.Register(
+		httpmock.GraphQL(`query OrganizationProjectList\b`),
+		httpmock.StringResponse(`
+			{ "data": { "organization": { "projects": {
+				"nodes": [
+					{ "name": "Triage", "id": "TRIAGEID", "resourcePath": "/orgs/ORG/projects/1"  }
+				],
+				"pageInfo": { "hasNextPage": false }
+			} } } }
+			`))
+
+	projectPaths, err := ProjectNamesToPaths(client, repo, []string{"Triage", "Roadmap"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedProjectPaths := []string{"ORG/1", "OWNER/REPO/2"}
+	if !sliceEqual(projectPaths, expectedProjectPaths) {
+		t.Errorf("expected projects paths %v, got %v", expectedProjectPaths, projectPaths)
 	}
 }
 

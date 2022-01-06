@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/cli/cli/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -50,15 +50,23 @@ func TestGraphQLError(t *testing.T) {
 		httpmock.GraphQL(""),
 		httpmock.StringResponse(`
 			{ "errors": [
-				{"message":"OH NO"},
-				{"message":"this is fine"}
+				{
+					"type": "NOT_FOUND",
+					"message": "OH NO",
+					"path": ["repository", "issue"]
+				},
+				{
+					"type": "ACTUALLY_ITS_FINE",
+					"message": "this is fine",
+					"path": ["repository", "issues", 0, "comments"]
+				}
 			  ]
 			}
 		`),
 	)
 
 	err := client.GraphQL("github.com", "", nil, &response)
-	if err == nil || err.Error() != "GraphQL error: OH NO\nthis is fine" {
+	if err == nil || err.Error() != "GraphQL: OH NO (repository.issue), this is fine (repository.issues.0.comments)" {
 		t.Fatalf("got %q", err.Error())
 	}
 }
@@ -78,6 +86,26 @@ func TestRESTGetDelete(t *testing.T) {
 	r := bytes.NewReader([]byte(`{}`))
 	err := client.REST("github.com", "DELETE", "applications/CLIENTID/grant", r, nil)
 	assert.NoError(t, err)
+}
+
+func TestRESTWithFullURL(t *testing.T) {
+	http := &httpmock.Registry{}
+	client := NewClient(ReplaceTripper(http))
+
+	http.Register(
+		httpmock.REST("GET", "api/v3/user/repos"),
+		httpmock.StatusStringResponse(200, "{}"))
+	http.Register(
+		httpmock.REST("GET", "user/repos"),
+		httpmock.StatusStringResponse(200, "{}"))
+
+	err := client.REST("example.com", "GET", "user/repos", nil, nil)
+	assert.NoError(t, err)
+	err = client.REST("example.com", "GET", "https://another.net/user/repos", nil, nil)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "example.com", http.Requests[0].URL.Hostname())
+	assert.Equal(t, "another.net", http.Requests[1].URL.Hostname())
 }
 
 func TestRESTError(t *testing.T) {
@@ -110,66 +138,88 @@ func TestRESTError(t *testing.T) {
 	}
 }
 
-func Test_HasMinimumScopes(t *testing.T) {
+func TestHandleHTTPError_GraphQL502(t *testing.T) {
+	req, err := http.NewRequest("GET", "https://api.github.com/user", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{
+		Request:    req,
+		StatusCode: 502,
+		Body:       ioutil.NopCloser(bytes.NewBufferString(`{ "data": null, "errors": [{ "message": "Something went wrong" }] }`)),
+		Header:     map[string][]string{"Content-Type": {"application/json"}},
+	}
+	err = HandleHTTPError(resp)
+	if err == nil || err.Error() != "HTTP 502: Something went wrong (https://api.github.com/user)" {
+		t.Errorf("got error: %v", err)
+	}
+}
+
+func TestHTTPError_ScopesSuggestion(t *testing.T) {
+	makeResponse := func(s int, u, haveScopes, needScopes string) *http.Response {
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{
+			Request:    req,
+			StatusCode: s,
+			Body:       ioutil.NopCloser(bytes.NewBufferString(`{}`)),
+			Header: map[string][]string{
+				"Content-Type":            {"application/json"},
+				"X-Oauth-Scopes":          {haveScopes},
+				"X-Accepted-Oauth-Scopes": {needScopes},
+			},
+		}
+	}
+
 	tests := []struct {
-		name    string
-		header  string
-		wantErr string
+		name string
+		resp *http.Response
+		want string
 	}{
 		{
-			name:    "no scopes",
-			header:  "",
-			wantErr: "",
+			name: "has necessary scopes",
+			resp: makeResponse(404, "https://api.github.com/gists", "repo, gist, read:org", "gist"),
+			want: ``,
 		},
 		{
-			name:    "default scopes",
-			header:  "repo, read:org",
-			wantErr: "",
+			name: "normalizes scopes",
+			resp: makeResponse(404, "https://api.github.com/orgs/ORG/discussions", "admin:org, write:discussion", "read:org, read:discussion"),
+			want: ``,
 		},
 		{
-			name:    "admin:org satisfies read:org",
-			header:  "repo, admin:org",
-			wantErr: "",
+			name: "no scopes on endpoint",
+			resp: makeResponse(404, "https://api.github.com/user", "repo", ""),
+			want: ``,
 		},
 		{
-			name:    "insufficient scope",
-			header:  "repo",
-			wantErr: "missing required scope 'read:org'",
+			name: "missing a scope",
+			resp: makeResponse(404, "https://api.github.com/gists", "repo, read:org", "gist, delete_repo"),
+			want: `This API operation needs the "gist" scope. To request it, run:  gh auth refresh -h github.com -s gist`,
 		},
 		{
-			name:    "insufficient scopes",
-			header:  "gist",
-			wantErr: "missing required scopes 'repo', 'read:org'",
+			name: "server error",
+			resp: makeResponse(500, "https://api.github.com/gists", "repo", "gist"),
+			want: ``,
+		},
+		{
+			name: "no scopes on token",
+			resp: makeResponse(404, "https://api.github.com/gists", "", "gist, delete_repo"),
+			want: ``,
+		},
+		{
+			name: "http code is 422",
+			resp: makeResponse(422, "https://api.github.com/gists", "", "gist"),
+			want: "",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fakehttp := &httpmock.Registry{}
-			client := NewClient(ReplaceTripper(fakehttp))
-
-			fakehttp.Register(httpmock.REST("GET", ""), func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					Request:    req,
-					StatusCode: 200,
-					Body:       ioutil.NopCloser(&bytes.Buffer{}),
-					Header: map[string][]string{
-						"X-Oauth-Scopes": {tt.header},
-					},
-				}, nil
-			})
-
-			err := client.HasMinimumScopes("github.com")
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("error: %v", err)
-				}
-				return
-			}
-			if err.Error() != tt.wantErr {
-				t.Errorf("want %q, got %q", tt.wantErr, err.Error())
-
+			httpError := HandleHTTPError(tt.resp)
+			if got := httpError.(HTTPError).ScopesSuggestion(); got != tt.want {
+				t.Errorf("HTTPError.ScopesSuggestion() = %v, want %v", got, tt.want)
 			}
 		})
 	}
-
 }

@@ -5,11 +5,12 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/cli/cli/pkg/cmd/gist/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmd/gist/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
@@ -133,6 +134,9 @@ func Test_deleteRun(t *testing.T) {
 
 		tt.opts.HttpClient = func() (*http.Client, error) {
 			return &http.Client{Transport: reg}, nil
+		}
+		tt.opts.Config = func() (config.Config, error) {
+			return config.NewBlankConfig(), nil
 		}
 		io, _, _, _ := iostreams.Test()
 		io.SetStdoutTTY(!tt.nontty)

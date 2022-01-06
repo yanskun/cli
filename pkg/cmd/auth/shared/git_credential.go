@@ -2,44 +2,82 @@ package shared
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/run"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/run"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/google/shlex"
 )
 
-type configReader interface {
-	Get(string, string) (string, error)
+type GitCredentialFlow struct {
+	Executable string
+
+	shouldSetup bool
+	helper      string
+	scopes      []string
 }
 
-func GitCredentialSetup(cfg configReader, hostname, username string) error {
-	helper, _ := gitCredentialHelper(hostname)
-	if isOurCredentialHelper(helper) {
+func (flow *GitCredentialFlow) Prompt(hostname string) error {
+	var gitErr error
+	flow.helper, gitErr = gitCredentialHelper(hostname)
+	if isOurCredentialHelper(flow.helper) {
+		flow.scopes = append(flow.scopes, "workflow")
 		return nil
 	}
 
-	var primeCredentials bool
 	err := prompt.SurveyAskOne(&survey.Confirm{
 		Message: "Authenticate Git with your GitHub credentials?",
 		Default: true,
-	}, &primeCredentials)
+	}, &flow.shouldSetup)
 	if err != nil {
 		return fmt.Errorf("could not prompt: %w", err)
 	}
-
-	if !primeCredentials {
-		return nil
+	if flow.shouldSetup {
+		if isGitMissing(gitErr) {
+			return gitErr
+		}
+		flow.scopes = append(flow.scopes, "workflow")
 	}
 
-	if helper == "" {
+	return nil
+}
+
+func (flow *GitCredentialFlow) Scopes() []string {
+	return flow.scopes
+}
+
+func (flow *GitCredentialFlow) ShouldSetup() bool {
+	return flow.shouldSetup
+}
+
+func (flow *GitCredentialFlow) Setup(hostname, username, authToken string) error {
+	return flow.gitCredentialSetup(hostname, username, authToken)
+}
+
+func (flow *GitCredentialFlow) gitCredentialSetup(hostname, username, password string) error {
+	if flow.helper == "" {
+		// first use a blank value to indicate to git we want to sever the chain of credential helpers
+		preConfigureCmd, err := git.GitCommand("config", "--global", "--replace-all", gitCredentialHelperKey(hostname), "")
+		if err != nil {
+			return err
+		}
+		if err = run.PrepareCmd(preConfigureCmd).Run(); err != nil {
+			return err
+		}
+
 		// use GitHub CLI as a credential helper (for this host only)
-		configureCmd, err := git.GitCommand("config", "--global", gitCredentialHelperKey(hostname), "!gh auth git-credential")
+		configureCmd, err := git.GitCommand(
+			"config", "--global", "--add",
+			gitCredentialHelperKey(hostname),
+			fmt.Sprintf("!%s auth git-credential", shellQuote(flow.Executable)),
+		)
 		if err != nil {
 			return err
 		}
@@ -67,7 +105,6 @@ func GitCredentialSetup(cfg configReader, hostname, username string) error {
 		return err
 	}
 
-	password, _ := cfg.Get(hostname, "oauth_token")
 	approveCmd.Stdin = bytes.NewBufferString(heredoc.Docf(`
 		protocol=https
 		host=%s
@@ -84,7 +121,7 @@ func GitCredentialSetup(cfg configReader, hostname, username string) error {
 }
 
 func gitCredentialHelperKey(hostname string) string {
-	return fmt.Sprintf("credential.https://%s.helper", hostname)
+	return fmt.Sprintf("credential.%s.helper", strings.TrimSuffix(ghinstance.HostPrefix(hostname), "/"))
 }
 
 func gitCredentialHelper(hostname string) (helper string, err error) {
@@ -107,4 +144,19 @@ func isOurCredentialHelper(cmd string) bool {
 	}
 
 	return strings.TrimSuffix(filepath.Base(args[0]), ".exe") == "gh"
+}
+
+func isGitMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errNotInstalled *git.NotInstalled
+	return errors.As(err, &errNotInstalled)
+}
+
+func shellQuote(s string) string {
+	if strings.ContainsAny(s, " $") {
+		return "'" + s + "'"
+	}
+	return s
 }

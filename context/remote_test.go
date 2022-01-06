@@ -4,8 +4,8 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -57,4 +57,15 @@ func Test_translateRemotes(t *testing.T) {
 	if result[0].RepoName() != "hello" {
 		t.Errorf("got %q", result[0].RepoName())
 	}
+}
+
+func Test_FilterByHosts(t *testing.T) {
+	r1 := &Remote{Remote: &git.Remote{Name: "mona"}, Repo: ghrepo.NewWithHost("monalisa", "myfork", "test.com")}
+	r2 := &Remote{Remote: &git.Remote{Name: "origin"}, Repo: ghrepo.NewWithHost("monalisa", "octo-cat", "example.com")}
+	r3 := &Remote{Remote: &git.Remote{Name: "upstream"}, Repo: ghrepo.New("hubot", "tools")}
+	list := Remotes{r1, r2, r3}
+	f := list.FilterByHosts([]string{"example.com", "test.com"})
+	assert.Equal(t, 2, len(f))
+	assert.Equal(t, r1, f[0])
+	assert.Equal(t, r2, f[1])
 }

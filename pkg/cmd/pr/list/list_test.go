@@ -4,17 +4,16 @@ import (
 	"bytes"
 	"io/ioutil"
 	"net/http"
-	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/internal/run"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/test"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/run"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/test"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
@@ -25,8 +24,10 @@ func runCommand(rt http.RoundTripper, isTTY bool, cli string) (*test.CmdOut, err
 	io.SetStdinTTY(isTTY)
 	io.SetStderrTTY(isTTY)
 
+	browser := &cmdutil.TestBrowser{}
 	factory := &cmdutil.Factory{
 		IOStreams: io,
+		Browser:   browser,
 		HttpClient: func() (*http.Client, error) {
 			return &http.Client{Transport: rt}, nil
 		},
@@ -49,8 +50,9 @@ func runCommand(rt http.RoundTripper, isTTY bool, cli string) (*test.CmdOut, err
 
 	_, err = cmd.ExecuteC()
 	return &test.CmdOut{
-		OutBuf: stdout,
-		ErrBuf: stderr,
+		OutBuf:     stdout,
+		ErrBuf:     stderr,
+		BrowsedURL: browser.BrowsedURL(),
 	}, err
 }
 
@@ -72,7 +74,7 @@ func TestPRList(t *testing.T) {
 	assert.Equal(t, heredoc.Doc(`
 
 		Showing 3 of 3 open pull requests in OWNER/REPO
-		
+
 		#32  New feature            feature
 		#29  Fixed bad bug          hubot:bug-fix
 		#28  Improve documentation  docs
@@ -107,10 +109,9 @@ func TestPRList_filtering(t *testing.T) {
 		httpmock.GraphQL(`query PullRequestList\b`),
 		httpmock.GraphQLQuery(`{}`, func(_ string, params map[string]interface{}) {
 			assert.Equal(t, []interface{}{"OPEN", "CLOSED", "MERGED"}, params["state"].([]interface{}))
-			assert.Equal(t, []interface{}{"one", "two", "three"}, params["labels"].([]interface{}))
 		}))
 
-	output, err := runCommand(http, true, `-s all -l one,two -l three`)
+	output, err := runCommand(http, true, `-s all`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +131,7 @@ func TestPRList_filteringRemoveDuplicate(t *testing.T) {
 		httpmock.GraphQL(`query PullRequestList\b`),
 		httpmock.FileResponse("./fixtures/prListWithDuplicates.json"))
 
-	output, err := runCommand(http, true, "-l one,two")
+	output, err := runCommand(http, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,14 +160,30 @@ func TestPRList_filteringClosed(t *testing.T) {
 	}
 }
 
-func TestPRList_filteringAssignee(t *testing.T) {
+func TestPRList_filteringHeadBranch(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
 	http.Register(
 		httpmock.GraphQL(`query PullRequestList\b`),
 		httpmock.GraphQLQuery(`{}`, func(_ string, params map[string]interface{}) {
-			assert.Equal(t, `repo:OWNER/REPO assignee:hubot is:pr sort:created-desc is:merged label:"needs tests" base:"develop"`, params["q"].(string))
+			assert.Equal(t, interface{}("bug-fix"), params["headBranch"])
+		}))
+
+	_, err := runCommand(http, true, `-H bug-fix`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPRList_filteringAssignee(t *testing.T) {
+	http := initFakeHTTP()
+	defer http.Verify(t)
+
+	http.Register(
+		httpmock.GraphQL(`query PullRequestSearch\b`),
+		httpmock.GraphQLQuery(`{}`, func(_ string, params map[string]interface{}) {
+			assert.Equal(t, `repo:OWNER/REPO is:pr is:merged assignee:hubot label:"needs tests" base:develop`, params["q"].(string))
 		}))
 
 	_, err := runCommand(http, true, `-s merged -l "needs tests" -a hubot -B develop`)
@@ -175,51 +192,89 @@ func TestPRList_filteringAssignee(t *testing.T) {
 	}
 }
 
-func TestPRList_filteringAssigneeLabels(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
+func TestPRList_filteringDraft(t *testing.T) {
+	tests := []struct {
+		name          string
+		cli           string
+		expectedQuery string
+	}{
+		{
+			name:          "draft",
+			cli:           "--draft",
+			expectedQuery: `repo:OWNER/REPO is:pr is:open draft:true`,
+		},
+		{
+			name:          "non-draft",
+			cli:           "--draft=false",
+			expectedQuery: `repo:OWNER/REPO is:pr is:open draft:false`,
+		},
+	}
 
-	_, err := runCommand(http, true, `-l one,two -a hubot`)
-	if err == nil && err.Error() != "multiple labels with --assignee are not supported" {
-		t.Fatal(err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			http := initFakeHTTP()
+			defer http.Verify(t)
+
+			http.Register(
+				httpmock.GraphQL(`query PullRequestSearch\b`),
+				httpmock.GraphQLQuery(`{}`, func(_ string, params map[string]interface{}) {
+					assert.Equal(t, test.expectedQuery, params["q"].(string))
+				}))
+
+			_, err := runCommand(http, true, test.cli)
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
 func TestPRList_withInvalidLimitFlag(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
-
 	_, err := runCommand(http, true, `--limit=0`)
-	if err == nil && err.Error() != "invalid limit: 0" {
-		t.Errorf("error running command `issue list`: %v", err)
-	}
+	assert.EqualError(t, err, "invalid value for --limit: 0")
 }
 
 func TestPRList_web(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	var seenCmd *exec.Cmd
-	//nolint:staticcheck // SA1019 TODO: rewrite to use run.Stub
-	restoreCmd := run.SetPrepareCmd(func(cmd *exec.Cmd) run.Runnable {
-		seenCmd = cmd
-		return &test.OutputStub{}
-	})
-	defer restoreCmd()
-
-	output, err := runCommand(http, true, "--web -a peter -l bug -l docs -L 10 -s merged -B trunk")
-	if err != nil {
-		t.Errorf("error running command `pr list` with `--web` flag: %v", err)
+	tests := []struct {
+		name               string
+		cli                string
+		expectedBrowserURL string
+	}{
+		{
+			name:               "filters",
+			cli:                "-a peter -l bug -l docs -L 10 -s merged -B trunk",
+			expectedBrowserURL: "https://github.com/OWNER/REPO/pulls?q=is%3Apr+is%3Amerged+assignee%3Apeter+label%3Abug+label%3Adocs+base%3Atrunk",
+		},
+		{
+			name:               "draft",
+			cli:                "--draft=true",
+			expectedBrowserURL: "https://github.com/OWNER/REPO/pulls?q=is%3Apr+is%3Aopen+draft%3Atrue",
+		},
+		{
+			name:               "non-draft",
+			cli:                "--draft=0",
+			expectedBrowserURL: "https://github.com/OWNER/REPO/pulls?q=is%3Apr+is%3Aopen+draft%3Afalse",
+		},
 	}
 
-	expectedURL := "https://github.com/OWNER/REPO/pulls?q=is%3Apr+is%3Amerged+assignee%3Apeter+label%3Abug+label%3Adocs+base%3Atrunk"
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			http := initFakeHTTP()
+			defer http.Verify(t)
 
-	assert.Equal(t, "", output.String())
-	assert.Equal(t, "Opening github.com/OWNER/REPO/pulls in your browser.\n", output.Stderr())
+			_, cmdTeardown := run.Stub()
+			defer cmdTeardown(t)
 
-	if seenCmd == nil {
-		t.Fatal("expected a command to run")
+			output, err := runCommand(http, true, "--web "+test.cli)
+			if err != nil {
+				t.Errorf("error running command `pr list` with `--web` flag: %v", err)
+			}
+
+			assert.Equal(t, "", output.String())
+			assert.Equal(t, "Opening github.com/OWNER/REPO/pulls in your browser.\n", output.Stderr())
+			assert.Equal(t, test.expectedBrowserURL, output.BrowsedURL)
+		})
 	}
-	url := seenCmd.Args[len(seenCmd.Args)-1]
-	assert.Equal(t, url, expectedURL)
 }

@@ -3,21 +3,26 @@ package refresh
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/authflow"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmd/auth/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/internal/authflow"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmd/auth/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/spf13/cobra"
 )
 
 type RefreshOptions struct {
-	IO     *iostreams.IOStreams
-	Config func() (config.Config, error)
+	IO         *iostreams.IOStreams
+	Config     func() (config.Config, error)
+	httpClient *http.Client
+
+	MainExecutable string
 
 	Hostname string
 	Scopes   []string
@@ -34,6 +39,7 @@ func NewCmdRefresh(f *cmdutil.Factory, runF func(*RefreshOptions) error) *cobra.
 			_, err := authflow.AuthFlowWithConfig(cfg, io, hostname, "", scopes)
 			return err
 		},
+		httpClient: http.DefaultClient,
 	}
 
 	cmd := &cobra.Command{
@@ -56,9 +62,10 @@ func NewCmdRefresh(f *cmdutil.Factory, runF func(*RefreshOptions) error) *cobra.
 			opts.Interactive = opts.IO.CanPrompt()
 
 			if !opts.Interactive && opts.Hostname == "" {
-				return &cmdutil.FlagError{Err: errors.New("--hostname required when not running interactively")}
+				return cmdutil.FlagErrorf("--hostname required when not running interactively")
 			}
 
+			opts.MainExecutable = f.Executable()
 			if runF != nil {
 				return runF(opts)
 			}
@@ -80,6 +87,9 @@ func refreshRun(opts *RefreshOptions) error {
 
 	candidates, err := cfg.Hosts()
 	if err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
 		return fmt.Errorf("not logged in to any hosts. Use 'gh auth login' to authenticate with a host")
 	}
 
@@ -121,14 +131,37 @@ func refreshRun(opts *RefreshOptions) error {
 		return err
 	}
 
-	if err := opts.AuthFlow(cfg, opts.IO, hostname, opts.Scopes); err != nil {
+	var additionalScopes []string
+	if oldToken, _ := cfg.Get(hostname, "oauth_token"); oldToken != "" {
+		if oldScopes, err := shared.GetScopes(opts.httpClient, hostname, oldToken); err == nil {
+			for _, s := range strings.Split(oldScopes, ",") {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					additionalScopes = append(additionalScopes, s)
+				}
+			}
+		}
+	}
+
+	credentialFlow := &shared.GitCredentialFlow{
+		Executable: opts.MainExecutable,
+	}
+	gitProtocol, _ := cfg.Get(hostname, "git_protocol")
+	if opts.Interactive && gitProtocol == "https" {
+		if err := credentialFlow.Prompt(hostname); err != nil {
+			return err
+		}
+		additionalScopes = append(additionalScopes, credentialFlow.Scopes()...)
+	}
+
+	if err := opts.AuthFlow(cfg, opts.IO, hostname, append(opts.Scopes, additionalScopes...)); err != nil {
 		return err
 	}
 
-	protocol, _ := cfg.Get(hostname, "git_protocol")
-	if opts.Interactive && protocol == "https" {
+	if credentialFlow.ShouldSetup() {
 		username, _ := cfg.Get(hostname, "user")
-		if err := shared.GitCredentialSetup(cfg, hostname, username); err != nil {
+		password, _ := cfg.Get(hostname, "oauth_token")
+		if err := credentialFlow.Setup(hostname, username, password); err != nil {
 			return err
 		}
 	}

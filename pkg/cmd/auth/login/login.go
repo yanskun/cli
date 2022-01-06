@@ -4,24 +4,26 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/authflow"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/pkg/cmd/auth/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/pkg/cmd/auth/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/spf13/cobra"
 )
 
 type LoginOptions struct {
-	IO     *iostreams.IOStreams
-	Config func() (config.Config, error)
+	IO         *iostreams.IOStreams
+	Config     func() (config.Config, error)
+	HttpClient func() (*http.Client, error)
+
+	MainExecutable string
 
 	Interactive bool
 
@@ -33,8 +35,9 @@ type LoginOptions struct {
 
 func NewCmdLogin(f *cmdutil.Factory, runF func(*LoginOptions) error) *cobra.Command {
 	opts := &LoginOptions{
-		IO:     f.IOStreams,
-		Config: f.Config,
+		IO:         f.IOStreams,
+		Config:     f.Config,
+		HttpClient: f.HttpClient,
 	}
 
 	var tokenStdin bool
@@ -66,11 +69,11 @@ func NewCmdLogin(f *cmdutil.Factory, runF func(*LoginOptions) error) *cobra.Comm
 		`),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !opts.IO.CanPrompt() && !(tokenStdin || opts.Web) {
-				return &cmdutil.FlagError{Err: errors.New("--web or --with-token required when not running interactively")}
+				return cmdutil.FlagErrorf("--web or --with-token required when not running interactively")
 			}
 
 			if tokenStdin && opts.Web {
-				return &cmdutil.FlagError{Err: errors.New("specify only one of --web or --with-token")}
+				return cmdutil.FlagErrorf("specify only one of --web or --with-token")
 			}
 
 			if tokenStdin {
@@ -88,7 +91,7 @@ func NewCmdLogin(f *cmdutil.Factory, runF func(*LoginOptions) error) *cobra.Comm
 
 			if cmd.Flags().Changed("hostname") {
 				if err := ghinstance.HostnameValidator(opts.Hostname); err != nil {
-					return &cmdutil.FlagError{Err: fmt.Errorf("error parsing --hostname: %w", err)}
+					return cmdutil.FlagErrorf("error parsing --hostname: %w", err)
 				}
 			}
 
@@ -98,6 +101,7 @@ func NewCmdLogin(f *cmdutil.Factory, runF func(*LoginOptions) error) *cobra.Comm
 				}
 			}
 
+			opts.MainExecutable = f.Executable()
 			if runF != nil {
 				return runF(opts)
 			}
@@ -143,18 +147,18 @@ func loginRun(opts *LoginOptions) error {
 		return err
 	}
 
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return err
+	}
+
 	if opts.Token != "" {
 		err := cfg.Set(hostname, "oauth_token", opts.Token)
 		if err != nil {
 			return err
 		}
 
-		apiClient, err := shared.ClientFromCfg(hostname, cfg)
-		if err != nil {
-			return err
-		}
-
-		if err := apiClient.HasMinimumScopes(hostname); err != nil {
+		if err := shared.HasMinimumScopes(httpClient, hostname, opts.Token); err != nil {
 			return fmt.Errorf("error validating token: %w", err)
 		}
 
@@ -162,146 +166,34 @@ func loginRun(opts *LoginOptions) error {
 	}
 
 	existingToken, _ := cfg.Get(hostname, "oauth_token")
-
 	if existingToken != "" && opts.Interactive {
-		apiClient, err := shared.ClientFromCfg(hostname, cfg)
-		if err != nil {
-			return err
-		}
-
-		if err := apiClient.HasMinimumScopes(hostname); err == nil {
-			username, err := api.CurrentLoginName(apiClient, hostname)
-			if err != nil {
-				return fmt.Errorf("error using api: %w", err)
-			}
+		if err := shared.HasMinimumScopes(httpClient, hostname, existingToken); err == nil {
 			var keepGoing bool
 			err = prompt.SurveyAskOne(&survey.Confirm{
 				Message: fmt.Sprintf(
-					"You're already logged into %s as %s. Do you want to re-authenticate?",
-					hostname,
-					username),
+					"You're already logged into %s. Do you want to re-authenticate?",
+					hostname),
 				Default: false,
 			}, &keepGoing)
 			if err != nil {
 				return fmt.Errorf("could not prompt: %w", err)
 			}
-
 			if !keepGoing {
 				return nil
 			}
 		}
 	}
 
-	var authMode int
-	if opts.Web {
-		authMode = 0
-	} else {
-		err = prompt.SurveyAskOne(&survey.Select{
-			Message: "How would you like to authenticate?",
-			Options: []string{
-				"Login with a web browser",
-				"Paste an authentication token",
-			},
-		}, &authMode)
-		if err != nil {
-			return fmt.Errorf("could not prompt: %w", err)
-		}
-	}
-
-	userValidated := false
-	if authMode == 0 {
-		_, err := authflow.AuthFlowWithConfig(cfg, opts.IO, hostname, "", opts.Scopes)
-		if err != nil {
-			return fmt.Errorf("failed to authenticate via web browser: %w", err)
-		}
-		userValidated = true
-	} else {
-		fmt.Fprintln(opts.IO.ErrOut)
-		fmt.Fprintln(opts.IO.ErrOut, heredoc.Doc(getAccessTokenTip(hostname)))
-		var token string
-		err := prompt.SurveyAskOne(&survey.Password{
-			Message: "Paste your authentication token:",
-		}, &token, survey.WithValidator(survey.Required))
-		if err != nil {
-			return fmt.Errorf("could not prompt: %w", err)
-		}
-
-		err = cfg.Set(hostname, "oauth_token", token)
-		if err != nil {
-			return err
-		}
-
-		apiClient, err := shared.ClientFromCfg(hostname, cfg)
-		if err != nil {
-			return err
-		}
-
-		if err := apiClient.HasMinimumScopes(hostname); err != nil {
-			return fmt.Errorf("error validating token: %w", err)
-		}
-	}
-
-	cs := opts.IO.ColorScheme()
-
-	var gitProtocol string
-	if opts.Interactive {
-		err = prompt.SurveyAskOne(&survey.Select{
-			Message: "Choose default git protocol",
-			Options: []string{
-				"HTTPS",
-				"SSH",
-			},
-		}, &gitProtocol)
-		if err != nil {
-			return fmt.Errorf("could not prompt: %w", err)
-		}
-
-		gitProtocol = strings.ToLower(gitProtocol)
-
-		fmt.Fprintf(opts.IO.ErrOut, "- gh config set -h %s git_protocol %s\n", hostname, gitProtocol)
-		err = cfg.Set(hostname, "git_protocol", gitProtocol)
-		if err != nil {
-			return err
-		}
-
-		fmt.Fprintf(opts.IO.ErrOut, "%s Configured git protocol\n", cs.SuccessIcon())
-	}
-
-	var username string
-	if userValidated {
-		username, _ = cfg.Get(hostname, "user")
-	} else {
-		apiClient, err := shared.ClientFromCfg(hostname, cfg)
-		if err != nil {
-			return err
-		}
-
-		username, err = api.CurrentLoginName(apiClient, hostname)
-		if err != nil {
-			return fmt.Errorf("error using api: %w", err)
-		}
-
-		err = cfg.Set(hostname, "user", username)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = cfg.Write()
-	if err != nil {
-		return err
-	}
-
-	if opts.Interactive && gitProtocol == "https" {
-		err := shared.GitCredentialSetup(cfg, hostname, username)
-		if err != nil {
-			return err
-		}
-	}
-
-	fmt.Fprintf(opts.IO.ErrOut, "%s Logged in as %s\n", cs.SuccessIcon(), cs.Bold(username))
-
-	return nil
+	return shared.Login(&shared.LoginOptions{
+		IO:          opts.IO,
+		Config:      cfg,
+		HTTPClient:  httpClient,
+		Hostname:    hostname,
+		Interactive: opts.Interactive,
+		Web:         opts.Web,
+		Scopes:      opts.Scopes,
+		Executable:  opts.MainExecutable,
+	})
 }
 
 func promptForHostname() (string, error) {
@@ -331,14 +223,4 @@ func promptForHostname() (string, error) {
 	}
 
 	return hostname, nil
-}
-
-func getAccessTokenTip(hostname string) string {
-	ghHostname := hostname
-	if ghHostname == "" {
-		ghHostname = ghinstance.OverridableDefault()
-	}
-	return fmt.Sprintf(`
-	Tip: you can generate a Personal Access Token here https://%s/settings/tokens
-	The minimum required scopes are 'repo' and 'read:org'.`, ghHostname)
 }

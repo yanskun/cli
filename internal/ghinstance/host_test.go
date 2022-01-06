@@ -6,29 +6,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestOverridableDefault(t *testing.T) {
-	oldOverride := hostnameOverride
-	t.Cleanup(func() {
-		hostnameOverride = oldOverride
-	})
-
-	host := OverridableDefault()
-	if host != "github.com" {
-		t.Errorf("expected github.com, got %q", host)
-	}
-
-	OverrideDefault("example.org")
-
-	host = OverridableDefault()
-	if host != "example.org" {
-		t.Errorf("expected example.org, got %q", host)
-	}
-	host = Default()
-	if host != "github.com" {
-		t.Errorf("expected github.com, got %q", host)
-	}
-}
-
 func TestIsEnterprise(t *testing.T) {
 	tests := []struct {
 		host string
@@ -40,6 +17,14 @@ func TestIsEnterprise(t *testing.T) {
 		},
 		{
 			host: "api.github.com",
+			want: false,
+		},
+		{
+			host: "github.localhost",
+			want: false,
+		},
+		{
+			host: "api.github.localhost",
 			want: false,
 		},
 		{
@@ -80,6 +65,14 @@ func TestNormalizeHostname(t *testing.T) {
 		{
 			host: "upload.github.com",
 			want: "github.com",
+		},
+		{
+			host: "GitHub.localhost",
+			want: "github.localhost",
+		},
+		{
+			host: "api.github.localhost",
+			want: "github.localhost",
 		},
 		{
 			host: "GHE.IO",
@@ -153,6 +146,10 @@ func TestGraphQLEndpoint(t *testing.T) {
 			want: "https://api.github.com/graphql",
 		},
 		{
+			host: "github.localhost",
+			want: "http://api.github.localhost/graphql",
+		},
+		{
 			host: "ghe.io",
 			want: "https://ghe.io/api/graphql",
 		},
@@ -174,6 +171,10 @@ func TestRESTPrefix(t *testing.T) {
 		{
 			host: "github.com",
 			want: "https://api.github.com/",
+		},
+		{
+			host: "github.localhost",
+			want: "http://api.github.localhost/",
 		},
 		{
 			host: "ghe.io",

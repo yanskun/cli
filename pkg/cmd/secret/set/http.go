@@ -2,26 +2,31 @@ package set
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/secret/shared"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghrepo"
 )
 
 type SecretPayload struct {
-	EncryptedValue string `json:"encrypted_value"`
-	Visibility     string `json:"visibility,omitempty"`
-	Repositories   []int  `json:"selected_repository_ids,omitempty"`
-	KeyID          string `json:"key_id"`
+	EncryptedValue string  `json:"encrypted_value"`
+	Visibility     string  `json:"visibility,omitempty"`
+	Repositories   []int64 `json:"selected_repository_ids,omitempty"`
+	KeyID          string  `json:"key_id"`
+}
+
+// The Codespaces Secret API currently expects repositories IDs as strings
+type CodespacesSecretPayload struct {
+	EncryptedValue string   `json:"encrypted_value"`
+	Repositories   []string `json:"selected_repository_ids,omitempty"`
+	KeyID          string   `json:"key_id"`
 }
 
 type PubKey struct {
-	Raw [32]byte
 	ID  string `json:"key_id"`
 	Key string
 }
@@ -32,23 +37,15 @@ func getPubKey(client *api.Client, host, path string) (*PubKey, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	if pk.Key == "" {
-		return nil, fmt.Errorf("failed to find public key at %s/%s", host, path)
-	}
-
-	decoded, err := base64.StdEncoding.DecodeString(pk.Key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode public key: %w", err)
-	}
-
-	copy(pk.Raw[:], decoded[0:32])
 	return &pk, nil
 }
 
-func getOrgPublicKey(client *api.Client, orgName string) (*PubKey, error) {
-	host := ghinstance.OverridableDefault()
+func getOrgPublicKey(client *api.Client, host, orgName string) (*PubKey, error) {
 	return getPubKey(client, host, fmt.Sprintf("orgs/%s/actions/secrets/public-key", orgName))
+}
+
+func getUserPublicKey(client *api.Client, host string) (*PubKey, error) {
+	return getPubKey(client, host, "user/codespaces/secrets/public-key")
 }
 
 func getRepoPubKey(client *api.Client, repo ghrepo.Interface) (*PubKey, error) {
@@ -56,7 +53,12 @@ func getRepoPubKey(client *api.Client, repo ghrepo.Interface) (*PubKey, error) {
 		ghrepo.FullName(repo)))
 }
 
-func putSecret(client *api.Client, host, path string, payload SecretPayload) error {
+func getEnvPubKey(client *api.Client, repo ghrepo.Interface, envName string) (*PubKey, error) {
+	return getPubKey(client, repo.RepoHost(), fmt.Sprintf("repos/%s/environments/%s/secrets/public-key",
+		ghrepo.FullName(repo), envName))
+}
+
+func putSecret(client *api.Client, host, path string, payload interface{}) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to serialize: %w", err)
@@ -66,21 +68,7 @@ func putSecret(client *api.Client, host, path string, payload SecretPayload) err
 	return client.REST(host, "PUT", path, requestBody, nil)
 }
 
-func putOrgSecret(client *api.Client, pk *PubKey, opts SetOptions, eValue string) error {
-	secretName := opts.SecretName
-	orgName := opts.OrgName
-	visibility := opts.Visibility
-	host := ghinstance.OverridableDefault()
-
-	var repositoryIDs []int
-	var err error
-	if orgName != "" && visibility == shared.Selected {
-		repositoryIDs, err = mapRepoNameToID(client, host, orgName, opts.RepositoryNames)
-		if err != nil {
-			return fmt.Errorf("failed to look up IDs for repositories %v: %w", opts.RepositoryNames, err)
-		}
-	}
-
+func putOrgSecret(client *api.Client, host string, pk *PubKey, orgName, visibility, secretName, eValue string, repositoryIDs []int64) error {
 	payload := SecretPayload{
 		EncryptedValue: eValue,
 		KeyID:          pk.ID,
@@ -92,6 +80,33 @@ func putOrgSecret(client *api.Client, pk *PubKey, opts SetOptions, eValue string
 	return putSecret(client, host, path, payload)
 }
 
+func putUserSecret(client *api.Client, host string, pk *PubKey, key, eValue string, repositoryIDs []int64) error {
+	payload := CodespacesSecretPayload{
+		EncryptedValue: eValue,
+		KeyID:          pk.ID,
+	}
+
+	if len(repositoryIDs) > 0 {
+		repositoryStringIDs := make([]string, len(repositoryIDs))
+		for i, id := range repositoryIDs {
+			repositoryStringIDs[i] = strconv.FormatInt(id, 10)
+		}
+		payload.Repositories = repositoryStringIDs
+	}
+
+	path := fmt.Sprintf("user/codespaces/secrets/%s", key)
+	return putSecret(client, host, path, payload)
+}
+
+func putEnvSecret(client *api.Client, pk *PubKey, repo ghrepo.Interface, envName string, secretName, eValue string) error {
+	payload := SecretPayload{
+		EncryptedValue: eValue,
+		KeyID:          pk.ID,
+	}
+	path := fmt.Sprintf("repos/%s/environments/%s/secrets/%s", ghrepo.FullName(repo), envName, secretName)
+	return putSecret(client, repo.RepoHost(), path, payload)
+}
+
 func putRepoSecret(client *api.Client, pk *PubKey, repo ghrepo.Interface, secretName, eValue string) error {
 	payload := SecretPayload{
 		EncryptedValue: eValue,
@@ -101,41 +116,36 @@ func putRepoSecret(client *api.Client, pk *PubKey, repo ghrepo.Interface, secret
 	return putSecret(client, repo.RepoHost(), path, payload)
 }
 
-func mapRepoNameToID(client *api.Client, host, orgName string, repositoryNames []string) ([]int, error) {
-	queries := make([]string, 0, len(repositoryNames))
-	for _, repoName := range repositoryNames {
+// This does similar logic to `api.RepoNetwork`, but without the overfetching.
+func mapRepoToID(client *api.Client, host string, repositories []ghrepo.Interface) ([]int64, error) {
+	queries := make([]string, 0, len(repositories))
+	for i, repo := range repositories {
 		queries = append(queries, fmt.Sprintf(`
-			%s: repository(owner: %q, name :%q) {
+			repo_%03d: repository(owner: %q, name: %q) {
 				databaseId
 			}
-		`, repoName, orgName, repoName))
+		`, i, repo.RepoOwner(), repo.RepoName()))
 	}
 
 	query := fmt.Sprintf(`query MapRepositoryNames { %s }`, strings.Join(queries, ""))
 
 	graphqlResult := make(map[string]*struct {
-		DatabaseID int `json:"databaseId"`
+		DatabaseID int64 `json:"databaseId"`
 	})
 
-	err := client.GraphQL(host, query, nil, &graphqlResult)
-
-	gqlErr, isGqlErr := err.(*api.GraphQLErrorResponse)
-	if isGqlErr {
-		for _, ge := range gqlErr.Errors {
-			if ge.Type == "NOT_FOUND" {
-				return nil, fmt.Errorf("could not find %s/%s", orgName, ge.Path[0])
-			}
-		}
-	}
-	if err != nil {
+	if err := client.GraphQL(host, query, nil, &graphqlResult); err != nil {
 		return nil, fmt.Errorf("failed to look up repositories: %w", err)
 	}
 
-	result := make([]int, 0, len(repositoryNames))
-
-	for _, repoName := range repositoryNames {
-		result = append(result, graphqlResult[repoName].DatabaseID)
+	repoKeys := make([]string, 0, len(repositories))
+	for k := range graphqlResult {
+		repoKeys = append(repoKeys, k)
 	}
+	sort.Strings(repoKeys)
 
+	result := make([]int64, len(repositories))
+	for i, k := range repoKeys {
+		result[i] = graphqlResult[k].DatabaseID
+	}
 	return result, nil
 }

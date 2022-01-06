@@ -2,17 +2,16 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/set"
 	"github.com/shurcooL/githubv4"
+	"golang.org/x/sync/errgroup"
 )
 
 type PullRequestsPayload struct {
@@ -25,108 +24,160 @@ type PullRequestsPayload struct {
 type PullRequestAndTotalCount struct {
 	TotalCount   int
 	PullRequests []PullRequest
+	SearchCapped bool
 }
 
 type PullRequest struct {
-	ID          string
-	Number      int
-	Title       string
-	State       string
-	Closed      bool
-	URL         string
-	BaseRefName string
-	HeadRefName string
-	Body        string
-	Mergeable   string
+	ID               string
+	Number           int
+	Title            string
+	State            string
+	Closed           bool
+	URL              string
+	BaseRefName      string
+	HeadRefName      string
+	Body             string
+	Mergeable        string
+	Additions        int
+	Deletions        int
+	ChangedFiles     int
+	MergeStateStatus string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ClosedAt         *time.Time
+	MergedAt         *time.Time
 
-	Author struct {
-		Login string
+	MergeCommit          *Commit
+	PotentialMergeCommit *Commit
+
+	Files struct {
+		Nodes []PullRequestFile
 	}
-	HeadRepositoryOwner struct {
-		Login string
-	}
-	HeadRepository struct {
-		Name             string
-		DefaultBranchRef struct {
-			Name string
-		}
-	}
+
+	Author              Author
+	MergedBy            *Author
+	HeadRepositoryOwner Owner
+	HeadRepository      *PRRepository
 	IsCrossRepository   bool
 	IsDraft             bool
 	MaintainerCanModify bool
+
+	BaseRef struct {
+		BranchProtectionRule struct {
+			RequiresStrictStatusChecks bool
+		}
+	}
 
 	ReviewDecision string
 
 	Commits struct {
 		TotalCount int
-		Nodes      []struct {
+		Nodes      []PullRequestCommit
+	}
+	StatusCheckRollup struct {
+		Nodes []struct {
 			Commit struct {
-				Oid               string
 				StatusCheckRollup struct {
 					Contexts struct {
 						Nodes []struct {
-							Name        string
-							Context     string
-							State       string
-							Status      string
-							Conclusion  string
-							StartedAt   time.Time
-							CompletedAt time.Time
-							DetailsURL  string
-							TargetURL   string
+							TypeName    string    `json:"__typename"`
+							Name        string    `json:"name"`
+							Context     string    `json:"context,omitempty"`
+							State       string    `json:"state,omitempty"`
+							Status      string    `json:"status"`
+							Conclusion  string    `json:"conclusion"`
+							StartedAt   time.Time `json:"startedAt"`
+							CompletedAt time.Time `json:"completedAt"`
+							DetailsURL  string    `json:"detailsUrl"`
+							TargetURL   string    `json:"targetUrl,omitempty"`
+						}
+						PageInfo struct {
+							HasNextPage bool
+							EndCursor   string
 						}
 					}
 				}
 			}
 		}
 	}
-	ReviewRequests struct {
-		Nodes []struct {
-			RequestedReviewer struct {
-				TypeName string `json:"__typename"`
-				Login    string
-				Name     string
-			}
-		}
-		TotalCount int
-	}
-	Assignees struct {
-		Nodes []struct {
-			Login string
-		}
-		TotalCount int
-	}
-	Labels struct {
-		Nodes []struct {
-			Name string
-		}
-		TotalCount int
-	}
-	ProjectCards struct {
-		Nodes []struct {
-			Project struct {
-				Name string
-			}
-			Column struct {
-				Name string
-			}
-		}
-		TotalCount int
-	}
-	Milestone struct {
-		Title string
-	}
+
+	Assignees      Assignees
+	Labels         Labels
+	ProjectCards   ProjectCards
+	Milestone      *Milestone
 	Comments       Comments
 	ReactionGroups ReactionGroups
 	Reviews        PullRequestReviews
+	ReviewRequests ReviewRequests
 }
 
-type NotFoundError struct {
-	error
+type PRRepository struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
-func (err *NotFoundError) Unwrap() error {
-	return err.error
+// Commit loads just the commit SHA and nothing else
+type Commit struct {
+	OID string `json:"oid"`
+}
+
+type PullRequestCommit struct {
+	Commit PullRequestCommitCommit
+}
+
+// PullRequestCommitCommit contains full information about a commit
+type PullRequestCommitCommit struct {
+	OID     string `json:"oid"`
+	Authors struct {
+		Nodes []struct {
+			Name  string
+			Email string
+			User  GitHubUser
+		}
+	}
+	MessageHeadline string
+	MessageBody     string
+	CommittedDate   time.Time
+	AuthoredDate    time.Time
+}
+
+type PullRequestFile struct {
+	Path      string `json:"path"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+}
+
+type ReviewRequests struct {
+	Nodes []struct {
+		RequestedReviewer RequestedReviewer
+	}
+}
+
+type RequestedReviewer struct {
+	TypeName     string `json:"__typename"`
+	Login        string `json:"login"`
+	Name         string `json:"name"`
+	Slug         string `json:"slug"`
+	Organization struct {
+		Login string `json:"login"`
+	} `json:"organization"`
+}
+
+func (r RequestedReviewer) LoginOrSlug() string {
+	if r.TypeName == teamTypeName {
+		return fmt.Sprintf("%s/%s", r.Organization.Login, r.Slug)
+	}
+	return r.Login
+}
+
+const teamTypeName = "Team"
+
+func (r ReviewRequests) Logins() []string {
+	logins := make([]string, len(r.Nodes))
+	for i, r := range r.Nodes {
+		logins[i] = r.RequestedReviewer.LoginOrSlug()
+	}
+	return logins
 }
 
 func (pr PullRequest) HeadLabel() string {
@@ -144,19 +195,15 @@ func (pr PullRequest) Identifier() string {
 	return pr.ID
 }
 
+func (pr PullRequest) IsOpen() bool {
+	return pr.State == "OPEN"
+}
+
 type PullRequestReviewStatus struct {
 	ChangesRequested bool
 	Approved         bool
 	ReviewRequired   bool
 }
-
-type PullRequestMergeMethod int
-
-const (
-	PullRequestMergeMethodMerge PullRequestMergeMethod = iota
-	PullRequestMergeMethodRebase
-	PullRequestMergeMethodSquash
-)
 
 func (pr *PullRequest) ReviewStatus() PullRequestReviewStatus {
 	var status PullRequestReviewStatus
@@ -179,10 +226,10 @@ type PullRequestChecksStatus struct {
 }
 
 func (pr *PullRequest) ChecksStatus() (summary PullRequestChecksStatus) {
-	if len(pr.Commits.Nodes) == 0 {
+	if len(pr.StatusCheckRollup.Nodes) == 0 {
 		return
 	}
-	commit := pr.Commits.Nodes[0].Commit
+	commit := pr.StatusCheckRollup.Nodes[0].Commit
 	for _, c := range commit.StatusCheckRollup.Contexts.Nodes {
 		state := c.State // StatusContext
 		if state == "" {
@@ -198,10 +245,8 @@ func (pr *PullRequest) ChecksStatus() (summary PullRequestChecksStatus) {
 			summary.Passing++
 		case "ERROR", "FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED":
 			summary.Failing++
-		case "EXPECTED", "REQUESTED", "QUEUED", "PENDING", "IN_PROGRESS", "STALE":
+		default: // "EXPECTED", "REQUESTED", "WAITING", "QUEUED", "PENDING", "IN_PROGRESS", "STALE"
 			summary.Pending++
-		default:
-			panic(fmt.Errorf("unsupported status: %q", state))
 		}
 		summary.Total++
 	}
@@ -220,39 +265,17 @@ func (pr *PullRequest) DisplayableReviews() PullRequestReviews {
 	return PullRequestReviews{Nodes: published, TotalCount: len(published)}
 }
 
-func (c Client) PullRequestDiff(baseRepo ghrepo.Interface, prNumber int) (io.ReadCloser, error) {
-	url := fmt.Sprintf("%srepos/%s/pulls/%d",
-		ghinstance.RESTPrefix(baseRepo.RepoHost()), ghrepo.FullName(baseRepo), prNumber)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Accept", "application/vnd.github.v3.diff; charset=utf-8")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode == 404 {
-		return nil, &NotFoundError{errors.New("pull request not found")}
-	} else if resp.StatusCode != 200 {
-		return nil, HandleHTTPError(resp)
-	}
-
-	return resp.Body, nil
-}
-
 type pullRequestFeature struct {
-	HasReviewDecision    bool
-	HasStatusCheckRollup bool
+	HasReviewDecision       bool
+	HasStatusCheckRollup    bool
+	HasBranchProtectionRule bool
 }
 
 func determinePullRequestFeatures(httpClient *http.Client, hostname string) (prFeatures pullRequestFeature, err error) {
 	if !ghinstance.IsEnterprise(hostname) {
 		prFeatures.HasReviewDecision = true
 		prFeatures.HasStatusCheckRollup = true
+		prFeatures.HasBranchProtectionRule = true
 		return
 	}
 
@@ -269,8 +292,26 @@ func determinePullRequestFeatures(httpClient *http.Client, hostname string) (prF
 		} `graphql:"Commit: __type(name: \"Commit\")"`
 	}
 
+	// needs to be a separate query because the backend only supports 2 `__type` expressions in one query
+	var featureDetection2 struct {
+		Ref struct {
+			Fields []struct {
+				Name string
+			} `graphql:"fields(includeDeprecated: true)"`
+		} `graphql:"Ref: __type(name: \"Ref\")"`
+	}
+
 	v4 := graphQLClient(httpClient, hostname)
-	err = v4.QueryNamed(context.Background(), "PullRequest_fields", &featureDetection, nil)
+
+	g := new(errgroup.Group)
+	g.Go(func() error {
+		return v4.QueryNamed(context.Background(), "PullRequest_fields", &featureDetection, nil)
+	})
+	g.Go(func() error {
+		return v4.QueryNamed(context.Background(), "PullRequest_fields2", &featureDetection2, nil)
+	})
+
+	err = g.Wait()
 	if err != nil {
 		return
 	}
@@ -287,10 +328,23 @@ func determinePullRequestFeatures(httpClient *http.Client, hostname string) (prF
 			prFeatures.HasStatusCheckRollup = true
 		}
 	}
+	for _, field := range featureDetection2.Ref.Fields {
+		switch field.Name {
+		case "branchProtectionRule":
+			prFeatures.HasBranchProtectionRule = true
+		}
+	}
 	return
 }
 
-func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, currentPRHeadRef, currentUsername string) (*PullRequestsPayload, error) {
+type StatusOptions struct {
+	CurrentPR int
+	HeadRef   string
+	Username  string
+	Fields    []string
+}
+
+func PullRequestStatus(client *Client, repo ghrepo.Interface, options StatusOptions) (*PullRequestsPayload, error) {
 	type edges struct {
 		TotalCount int
 		Edges      []struct {
@@ -310,66 +364,28 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
 		ReviewRequested edges
 	}
 
-	cachedClient := makeCachedClient(client.http, time.Hour*24)
-	prFeatures, err := determinePullRequestFeatures(cachedClient, repo.RepoHost())
-	if err != nil {
-		return nil, err
-	}
-
-	var reviewsFragment string
-	if prFeatures.HasReviewDecision {
-		reviewsFragment = "reviewDecision"
-	}
-
-	var statusesFragment string
-	if prFeatures.HasStatusCheckRollup {
-		statusesFragment = `
-		commits(last: 1) {
-			nodes {
-				commit {
-					statusCheckRollup {
-						contexts(last: 100) {
-							nodes {
-								...on StatusContext {
-									state
-								}
-								...on CheckRun {
-									conclusion
-									status
-								}
-							}
-						}
-					}
-				}
-			}
+	var fragments string
+	if len(options.Fields) > 0 {
+		fields := set.NewStringSet()
+		fields.AddValues(options.Fields)
+		// these are always necessary to find the PR for the current branch
+		fields.AddValues([]string{"isCrossRepository", "headRepositoryOwner", "headRefName"})
+		gr := PullRequestGraphQL(fields.ToSlice())
+		fragments = fmt.Sprintf("fragment pr on PullRequest{%s}fragment prWithReviews on PullRequest{...pr}", gr)
+	} else {
+		var err error
+		fragments, err = pullRequestFragment(client.http, repo.RepoHost())
+		if err != nil {
+			return nil, err
 		}
-		`
 	}
-
-	fragments := fmt.Sprintf(`
-	fragment pr on PullRequest {
-		number
-		title
-		state
-		url
-		headRefName
-		headRepositoryOwner {
-			login
-		}
-		isCrossRepository
-		isDraft
-		%s
-	}
-	fragment prWithReviews on PullRequest {
-		...pr
-		%s
-	}
-	`, statusesFragment, reviewsFragment)
 
 	queryPrefix := `
 	query PullRequestStatus($owner: String!, $repo: String!, $headRefName: String!, $viewerQuery: String!, $reviewerQuery: String!, $per_page: Int = 10) {
 		repository(owner: $owner, name: $repo) {
-			defaultBranchRef { name }
+			defaultBranchRef {
+				name
+			}
 			pullRequests(headRefName: $headRefName, first: $per_page, orderBy: { field: CREATED_AT, direction: DESC }) {
 				totalCount
 				edges {
@@ -380,11 +396,13 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
 			}
 		}
 	`
-	if currentPRNumber > 0 {
+	if options.CurrentPR > 0 {
 		queryPrefix = `
 		query PullRequestStatus($owner: String!, $repo: String!, $number: Int!, $viewerQuery: String!, $reviewerQuery: String!, $per_page: Int = 10) {
 			repository(owner: $owner, name: $repo) {
-				defaultBranchRef { name }
+				defaultBranchRef {
+					name
+				}
 				pullRequest(number: $number) {
 					...prWithReviews
 				}
@@ -412,7 +430,9 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
     }
 	`
 
+	currentUsername := options.Username
 	if currentUsername == "@me" && ghinstance.IsEnterprise(repo.RepoHost()) {
+		var err error
 		currentUsername, err = CurrentLoginName(client, repo.RepoHost())
 		if err != nil {
 			return nil, err
@@ -422,6 +442,7 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
 	viewerQuery := fmt.Sprintf("repo:%s state:open is:pr author:%s", ghrepo.FullName(repo), currentUsername)
 	reviewerQuery := fmt.Sprintf("repo:%s state:open review-requested:%s", ghrepo.FullName(repo), currentUsername)
 
+	currentPRHeadRef := options.HeadRef
 	branchWithoutOwner := currentPRHeadRef
 	if idx := strings.Index(currentPRHeadRef, ":"); idx >= 0 {
 		branchWithoutOwner = currentPRHeadRef[idx+1:]
@@ -433,11 +454,11 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
 		"owner":         repo.RepoOwner(),
 		"repo":          repo.RepoName(),
 		"headRefName":   branchWithoutOwner,
-		"number":        currentPRNumber,
+		"number":        options.CurrentPR,
 	}
 
 	var resp response
-	err = client.GraphQL(repo.RepoHost(), query, variables, &resp)
+	err := client.GraphQL(repo.RepoHost(), query, variables, &resp)
 	if err != nil {
 		return nil, err
 	}
@@ -478,268 +499,34 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
 	return &payload, nil
 }
 
-func prCommitsFragment(httpClient *http.Client, hostname string) (string, error) {
-	cachedClient := makeCachedClient(httpClient, time.Hour*24)
-	if prFeatures, err := determinePullRequestFeatures(cachedClient, hostname); err != nil {
+func pullRequestFragment(httpClient *http.Client, hostname string) (string, error) {
+	cachedClient := NewCachedClient(httpClient, time.Hour*24)
+	prFeatures, err := determinePullRequestFeatures(cachedClient, hostname)
+	if err != nil {
 		return "", err
-	} else if !prFeatures.HasStatusCheckRollup {
-		return "", nil
 	}
 
-	return `
-	commits(last: 1) {
-		totalCount
-		nodes {
-			commit {
-				oid
-				statusCheckRollup {
-					contexts(last: 100) {
-						nodes {
-							...on StatusContext {
-								context
-								state
-								targetUrl
-							}
-							...on CheckRun {
-								name
-								status
-								conclusion
-								startedAt
-								completedAt
-								detailsUrl
-							}
-						}
-					}
-				}
-			}
-		}
+	fields := []string{
+		"number", "title", "state", "url", "isDraft", "isCrossRepository",
+		"headRefName", "headRepositoryOwner", "mergeStateStatus",
 	}
-	`, nil
-}
-
-func PullRequestByNumber(client *Client, repo ghrepo.Interface, number int) (*PullRequest, error) {
-	type response struct {
-		Repository struct {
-			PullRequest PullRequest
-		}
+	if prFeatures.HasStatusCheckRollup {
+		fields = append(fields, "statusCheckRollup")
+	}
+	if prFeatures.HasBranchProtectionRule {
+		fields = append(fields, "requiresStrictStatusChecks")
 	}
 
-	statusesFragment, err := prCommitsFragment(client.http, repo.RepoHost())
-	if err != nil {
-		return nil, err
+	var reviewFields []string
+	if prFeatures.HasReviewDecision {
+		reviewFields = append(reviewFields, "reviewDecision")
 	}
 
-	query := `
-	query PullRequestByNumber($owner: String!, $repo: String!, $pr_number: Int!) {
-		repository(owner: $owner, name: $repo) {
-			pullRequest(number: $pr_number) {
-				id
-				url
-				number
-				title
-				state
-				closed
-				body
-				mergeable
-				author {
-				  login
-				}
-				` + statusesFragment + `
-				baseRefName
-				headRefName
-				headRepositoryOwner {
-					login
-				}
-				headRepository {
-					name
-				}
-				isCrossRepository
-				isDraft
-				maintainerCanModify
-				reviewRequests(first: 100) {
-					nodes {
-						requestedReviewer {
-							__typename
-							...on User {
-								login
-							}
-							...on Team {
-								name
-							}
-						}
-					}
-					totalCount
-				}
-				assignees(first: 100) {
-					nodes {
-						login
-					}
-					totalCount
-				}
-				labels(first: 100) {
-					nodes {
-						name
-					}
-					totalCount
-				}
-				projectCards(first: 100) {
-					nodes {
-						project {
-							name
-						}
-						column {
-							name
-						}
-					}
-					totalCount
-				}
-				milestone{
-					title
-				}
-				` + commentsFragment() + `
-				` + reactionGroupsFragment() + `
-			}
-		}
-	}`
-
-	variables := map[string]interface{}{
-		"owner":     repo.RepoOwner(),
-		"repo":      repo.RepoName(),
-		"pr_number": number,
-	}
-
-	var resp response
-	err = client.GraphQL(repo.RepoHost(), query, variables, &resp)
-	if err != nil {
-		return nil, err
-	}
-
-	return &resp.Repository.PullRequest, nil
-}
-
-func PullRequestForBranch(client *Client, repo ghrepo.Interface, baseBranch, headBranch string, stateFilters []string) (*PullRequest, error) {
-	type response struct {
-		Repository struct {
-			PullRequests struct {
-				Nodes []PullRequest
-			}
-		}
-	}
-
-	statusesFragment, err := prCommitsFragment(client.http, repo.RepoHost())
-	if err != nil {
-		return nil, err
-	}
-
-	query := `
-	query PullRequestForBranch($owner: String!, $repo: String!, $headRefName: String!, $states: [PullRequestState!]) {
-		repository(owner: $owner, name: $repo) {
-			pullRequests(headRefName: $headRefName, states: $states, first: 30, orderBy: { field: CREATED_AT, direction: DESC }) {
-				nodes {
-					id
-					number
-					title
-					state
-					body
-					mergeable
-					author {
-						login
-					}
-					` + statusesFragment + `
-					url
-					baseRefName
-					headRefName
-					headRepositoryOwner {
-						login
-					}
-					headRepository {
-						name
-					}
-					isCrossRepository
-					isDraft
-					maintainerCanModify
-					reviewRequests(first: 100) {
-						nodes {
-							requestedReviewer {
-								__typename
-								...on User {
-									login
-								}
-								...on Team {
-									name
-								}
-							}
-						}
-						totalCount
-					}
-					assignees(first: 100) {
-						nodes {
-							login
-						}
-						totalCount
-					}
-					labels(first: 100) {
-						nodes {
-							name
-						}
-						totalCount
-					}
-					projectCards(first: 100) {
-						nodes {
-							project {
-								name
-							}
-							column {
-								name
-							}
-						}
-						totalCount
-					}
-					milestone{
-						title
-					}
-					` + commentsFragment() + `
-					` + reactionGroupsFragment() + `
-				}
-			}
-		}
-	}`
-
-	branchWithoutOwner := headBranch
-	if idx := strings.Index(headBranch, ":"); idx >= 0 {
-		branchWithoutOwner = headBranch[idx+1:]
-	}
-
-	variables := map[string]interface{}{
-		"owner":       repo.RepoOwner(),
-		"repo":        repo.RepoName(),
-		"headRefName": branchWithoutOwner,
-		"states":      stateFilters,
-	}
-
-	var resp response
-	err = client.GraphQL(repo.RepoHost(), query, variables, &resp)
-	if err != nil {
-		return nil, err
-	}
-
-	prs := resp.Repository.PullRequests.Nodes
-	sortPullRequestsByState(prs)
-
-	for _, pr := range prs {
-		if pr.HeadLabel() == headBranch && (baseBranch == "" || pr.BaseRefName == baseBranch) {
-			return &pr, nil
-		}
-	}
-
-	return nil, &NotFoundError{fmt.Errorf("no pull requests found for branch %q", headBranch)}
-}
-
-// sortPullRequestsByState sorts a PullRequest slice by open-first
-func sortPullRequestsByState(prs []PullRequest) {
-	sort.SliceStable(prs, func(a, b int) bool {
-		return prs[a].State == "OPEN"
-	})
+	fragments := fmt.Sprintf(`
+	fragment pr on PullRequest {%s}
+	fragment prWithReviews on PullRequest {...pr,%s}
+	`, PullRequestGraphQL(fields), PullRequestGraphQL(reviewFields))
+	return fragments, nil
 }
 
 // CreatePullRequest creates a pull request in a GitHub repository
@@ -814,6 +601,7 @@ func CreatePullRequest(client *Client, repo *Repository, params map[string]inter
 		reviewParams["teamIds"] = ids
 	}
 
+	//TODO: How much work to extract this into own method and use for create and edit?
 	if len(reviewParams) > 0 {
 		reviewQuery := `
 		mutation PullRequestCreateRequestReviews($input: RequestReviewsInput!) {
@@ -833,6 +621,20 @@ func CreatePullRequest(client *Client, repo *Repository, params map[string]inter
 	return pr, nil
 }
 
+func UpdatePullRequestReviews(client *Client, repo ghrepo.Interface, params githubv4.RequestReviewsInput) error {
+	var mutation struct {
+		RequestReviews struct {
+			PullRequest struct {
+				ID string
+			}
+		} `graphql:"requestReviews(input: $input)"`
+	}
+	variables := map[string]interface{}{"input": params}
+	gql := graphQLClient(client.http, repo.RepoHost())
+	err := gql.MutateNamed(context.Background(), "PullRequestUpdateRequestReviews", &mutation, variables)
+	return err
+}
+
 func isBlank(v interface{}) bool {
 	switch vv := v.(type) {
 	case string:
@@ -844,175 +646,7 @@ func isBlank(v interface{}) bool {
 	}
 }
 
-func PullRequestList(client *Client, repo ghrepo.Interface, vars map[string]interface{}, limit int) (*PullRequestAndTotalCount, error) {
-	type prBlock struct {
-		Edges []struct {
-			Node PullRequest
-		}
-		PageInfo struct {
-			HasNextPage bool
-			EndCursor   string
-		}
-		TotalCount int
-		IssueCount int
-	}
-	type response struct {
-		Repository struct {
-			PullRequests prBlock
-		}
-		Search prBlock
-	}
-
-	fragment := `
-	fragment pr on PullRequest {
-		number
-		title
-		state
-		url
-		headRefName
-		headRepositoryOwner {
-			login
-		}
-		isCrossRepository
-		isDraft
-	}
-	`
-
-	// If assignee wasn't specified, use `Repository.pullRequest` for ability to
-	// query by multiple labels
-	query := fragment + `
-    query PullRequestList(
-		$owner: String!,
-		$repo: String!,
-		$limit: Int!,
-		$endCursor: String,
-		$baseBranch: String,
-		$labels: [String!],
-		$state: [PullRequestState!] = OPEN
-	) {
-      repository(owner: $owner, name: $repo) {
-        pullRequests(
-			states: $state,
-			baseRefName: $baseBranch,
-			labels: $labels,
-			first: $limit,
-			after: $endCursor,
-			orderBy: {field: CREATED_AT, direction: DESC}
-			) {
-				totalCount
-				edges {
-					node {
-						...pr
-					}
-				}
-				pageInfo {
-					hasNextPage
-					endCursor
-				}
-			}
-		}
-	}`
-
-	var check = make(map[int]struct{})
-	var prs []PullRequest
-	pageLimit := min(limit, 100)
-	variables := map[string]interface{}{}
-	res := PullRequestAndTotalCount{}
-
-	// If assignee was specified, use the `search` API rather than
-	// `Repository.pullRequests`, but this mode doesn't support multiple labels
-	if assignee, ok := vars["assignee"].(string); ok {
-		query = fragment + `
-		query PullRequestList(
-			$q: String!,
-			$limit: Int!,
-			$endCursor: String,
-		) {
-			search(query: $q, type: ISSUE, first: $limit, after: $endCursor) {
-				issueCount
-				edges {
-					node {
-						...pr
-					}
-				}
-				pageInfo {
-					hasNextPage
-					endCursor
-				}
-			}
-		}`
-		search := []string{
-			fmt.Sprintf("repo:%s/%s", repo.RepoOwner(), repo.RepoName()),
-			fmt.Sprintf("assignee:%s", assignee),
-			"is:pr",
-			"sort:created-desc",
-		}
-		if states, ok := vars["state"].([]string); ok && len(states) == 1 {
-			switch states[0] {
-			case "OPEN":
-				search = append(search, "state:open")
-			case "CLOSED":
-				search = append(search, "state:closed")
-			case "MERGED":
-				search = append(search, "is:merged")
-			}
-		}
-		if labels, ok := vars["labels"].([]string); ok && len(labels) > 0 {
-			if len(labels) > 1 {
-				return nil, fmt.Errorf("multiple labels with --assignee are not supported")
-			}
-			search = append(search, fmt.Sprintf(`label:"%s"`, labels[0]))
-		}
-		if baseBranch, ok := vars["baseBranch"].(string); ok {
-			search = append(search, fmt.Sprintf(`base:"%s"`, baseBranch))
-		}
-		variables["q"] = strings.Join(search, " ")
-	} else {
-		variables["owner"] = repo.RepoOwner()
-		variables["repo"] = repo.RepoName()
-		for name, val := range vars {
-			variables[name] = val
-		}
-	}
-loop:
-	for {
-		variables["limit"] = pageLimit
-		var data response
-		err := client.GraphQL(repo.RepoHost(), query, variables, &data)
-		if err != nil {
-			return nil, err
-		}
-		prData := data.Repository.PullRequests
-		res.TotalCount = prData.TotalCount
-		if _, ok := variables["q"]; ok {
-			prData = data.Search
-			res.TotalCount = prData.IssueCount
-		}
-
-		for _, edge := range prData.Edges {
-			if _, exists := check[edge.Node.Number]; exists {
-				continue
-			}
-
-			prs = append(prs, edge.Node)
-			check[edge.Node.Number] = struct{}{}
-			if len(prs) == limit {
-				break loop
-			}
-		}
-
-		if prData.PageInfo.HasNextPage {
-			variables["endCursor"] = prData.PageInfo.EndCursor
-			pageLimit = min(pageLimit, limit-len(prs))
-		} else {
-			break
-		}
-	}
-	res.PullRequests = prs
-	return &res, nil
-}
-
-func PullRequestClose(client *Client, repo ghrepo.Interface, pr *PullRequest) error {
+func PullRequestClose(httpClient *http.Client, repo ghrepo.Interface, prID string) error {
 	var mutation struct {
 		ClosePullRequest struct {
 			PullRequest struct {
@@ -1023,17 +657,15 @@ func PullRequestClose(client *Client, repo ghrepo.Interface, pr *PullRequest) er
 
 	variables := map[string]interface{}{
 		"input": githubv4.ClosePullRequestInput{
-			PullRequestID: pr.ID,
+			PullRequestID: prID,
 		},
 	}
 
-	gql := graphQLClient(client.http, repo.RepoHost())
-	err := gql.MutateNamed(context.Background(), "PullRequestClose", &mutation, variables)
-
-	return err
+	gql := graphQLClient(httpClient, repo.RepoHost())
+	return gql.MutateNamed(context.Background(), "PullRequestClose", &mutation, variables)
 }
 
-func PullRequestReopen(client *Client, repo ghrepo.Interface, pr *PullRequest) error {
+func PullRequestReopen(httpClient *http.Client, repo ghrepo.Interface, prID string) error {
 	var mutation struct {
 		ReopenPullRequest struct {
 			PullRequest struct {
@@ -1044,55 +676,12 @@ func PullRequestReopen(client *Client, repo ghrepo.Interface, pr *PullRequest) e
 
 	variables := map[string]interface{}{
 		"input": githubv4.ReopenPullRequestInput{
-			PullRequestID: pr.ID,
+			PullRequestID: prID,
 		},
 	}
 
-	gql := graphQLClient(client.http, repo.RepoHost())
-	err := gql.MutateNamed(context.Background(), "PullRequestReopen", &mutation, variables)
-
-	return err
-}
-
-func PullRequestMerge(client *Client, repo ghrepo.Interface, pr *PullRequest, m PullRequestMergeMethod, body *string) error {
-	mergeMethod := githubv4.PullRequestMergeMethodMerge
-	switch m {
-	case PullRequestMergeMethodRebase:
-		mergeMethod = githubv4.PullRequestMergeMethodRebase
-	case PullRequestMergeMethodSquash:
-		mergeMethod = githubv4.PullRequestMergeMethodSquash
-	}
-
-	var mutation struct {
-		MergePullRequest struct {
-			PullRequest struct {
-				ID githubv4.ID
-			}
-		} `graphql:"mergePullRequest(input: $input)"`
-	}
-
-	input := githubv4.MergePullRequestInput{
-		PullRequestID: pr.ID,
-		MergeMethod:   &mergeMethod,
-	}
-
-	if m == PullRequestMergeMethodSquash {
-		commitHeadline := githubv4.String(fmt.Sprintf("%s (#%d)", pr.Title, pr.Number))
-		input.CommitHeadline = &commitHeadline
-	}
-	if body != nil {
-		commitBody := githubv4.String(*body)
-		input.CommitBody = &commitBody
-	}
-
-	variables := map[string]interface{}{
-		"input": input,
-	}
-
-	gql := graphQLClient(client.http, repo.RepoHost())
-	err := gql.MutateNamed(context.Background(), "PullRequestMerge", &mutation, variables)
-
-	return err
+	gql := graphQLClient(httpClient, repo.RepoHost())
+	return gql.MutateNamed(context.Background(), "PullRequestReopen", &mutation, variables)
 }
 
 func PullRequestReady(client *Client, repo ghrepo.Interface, pr *PullRequest) error {
@@ -1117,11 +706,4 @@ func PullRequestReady(client *Client, repo ghrepo.Interface, pr *PullRequest) er
 func BranchDeleteRemote(client *Client, repo ghrepo.Interface, branch string) error {
 	path := fmt.Sprintf("repos/%s/%s/git/refs/heads/%s", repo.RepoOwner(), repo.RepoName(), branch)
 	return client.REST(repo.RepoHost(), "DELETE", path, nil, nil)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

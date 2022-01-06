@@ -8,30 +8,18 @@ import (
 
 const defaultHostname = "github.com"
 
-var hostnameOverride string
+// localhost is the domain name of a local GitHub instance
+const localhost = "github.localhost"
 
 // Default returns the host name of the default GitHub instance
 func Default() string {
 	return defaultHostname
 }
 
-// OverridableDefault is like Default, except it is overridable by the GH_HOST environment variable
-func OverridableDefault() string {
-	if hostnameOverride != "" {
-		return hostnameOverride
-	}
-	return defaultHostname
-}
-
-// OverrideDefault overrides the value returned from OverridableDefault. This should only ever be
-// called from the main runtime path, not tests.
-func OverrideDefault(newhost string) {
-	hostnameOverride = newhost
-}
-
 // IsEnterprise reports whether a non-normalized host name looks like a GHE instance
 func IsEnterprise(h string) bool {
-	return NormalizeHostname(h) != defaultHostname
+	normalizedHostName := NormalizeHostname(h)
+	return normalizedHostName != defaultHostname && normalizedHostName != localhost
 }
 
 // NormalizeHostname returns the canonical host name of a GitHub instance
@@ -40,6 +28,11 @@ func NormalizeHostname(h string) string {
 	if strings.HasSuffix(hostname, "."+defaultHostname) {
 		return defaultHostname
 	}
+
+	if strings.HasSuffix(hostname, "."+localhost) {
+		return localhost
+	}
+
 	return hostname
 }
 
@@ -62,19 +55,35 @@ func GraphQLEndpoint(hostname string) string {
 	if IsEnterprise(hostname) {
 		return fmt.Sprintf("https://%s/api/graphql", hostname)
 	}
-	return "https://api.github.com/graphql"
+	if strings.EqualFold(hostname, localhost) {
+		return fmt.Sprintf("http://api.%s/graphql", hostname)
+	}
+	return fmt.Sprintf("https://api.%s/graphql", hostname)
 }
 
 func RESTPrefix(hostname string) string {
 	if IsEnterprise(hostname) {
 		return fmt.Sprintf("https://%s/api/v3/", hostname)
 	}
-	return "https://api.github.com/"
+	if strings.EqualFold(hostname, localhost) {
+		return fmt.Sprintf("http://api.%s/", hostname)
+	}
+	return fmt.Sprintf("https://api.%s/", hostname)
 }
 
 func GistPrefix(hostname string) string {
 	if IsEnterprise(hostname) {
 		return fmt.Sprintf("https://%s/gist/", hostname)
 	}
+	if strings.EqualFold(hostname, localhost) {
+		return fmt.Sprintf("http://%s/gist/", hostname)
+	}
 	return fmt.Sprintf("https://gist.%s/", hostname)
+}
+
+func HostPrefix(hostname string) string {
+	if strings.EqualFold(hostname, localhost) {
+		return fmt.Sprintf("http://%s/", hostname)
+	}
+	return fmt.Sprintf("https://%s/", hostname)
 }

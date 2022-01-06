@@ -2,17 +2,14 @@ package list
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"time"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghinstance"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghinstance"
 )
-
-var scopesError = errors.New("insufficient OAuth scopes")
 
 type sshKey struct {
 	Key       string
@@ -20,12 +17,12 @@ type sshKey struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func userKeys(httpClient *http.Client, userHandle string) ([]sshKey, error) {
+func userKeys(httpClient *http.Client, host, userHandle string) ([]sshKey, error) {
 	resource := "user/keys"
 	if userHandle != "" {
 		resource = fmt.Sprintf("users/%s/keys", userHandle)
 	}
-	url := fmt.Sprintf("%s%s?per_page=%d", ghinstance.RESTPrefix(ghinstance.OverridableDefault()), resource, 100)
+	url := fmt.Sprintf("%s%s?per_page=%d", ghinstance.RESTPrefix(host), resource, 100)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -37,9 +34,7 @@ func userKeys(httpClient *http.Client, userHandle string) ([]sshKey, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 404 {
-		return nil, scopesError
-	} else if resp.StatusCode > 299 {
+	if resp.StatusCode > 299 {
 		return nil, api.HandleHTTPError(resp)
 	}
 
