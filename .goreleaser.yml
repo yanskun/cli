@@ -9,10 +9,7 @@ before:
   hooks:
     - go mod tidy
     - make manpages GH_VERSION={{.Version}}
-    - cmd: ./scripts/prepare-windows-cert.sh
-      env:
-        - GITHUB_CERT_PASSWORD={{ .Env.GITHUB_CERT_PASSWORD }}
-        - DESKTOP_CERT_TOKEN={{ .Env.DESKTOP_CERT_TOKEN }}
+    - ./scripts/prepare-windows-cert.sh "{{.Env.GITHUB_CERT_PASSWORD}}" "{{.Env.DESKTOP_CERT_TOKEN}}"
 
 builds:
   - <<: &build_defaults
