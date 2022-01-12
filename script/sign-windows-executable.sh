@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+EXECUTABLE_PATH=$1
+
 ARCH="386"
 
 if [[ $EXECUTABLE_PATH =~ "amd64" ]]; then
