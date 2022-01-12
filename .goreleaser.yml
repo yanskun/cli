@@ -9,6 +9,10 @@ before:
   hooks:
     - go mod tidy
     - make manpages GH_VERSION={{.Version}}
+    - cmd: ./scripts/prepare-windows-cert.sh
+      env:
+        - GITHUB_CERT_PASSWORD={{ .Env.GITHUB_CERT_PASSWORD }}
+        - DESKTOP_CERT_TOKEN={{ .Env.DESKTOP_CERT_TOKEN }}
 
 builds:
   - <<: &build_defaults
@@ -34,10 +38,7 @@ builds:
     goarch: [386, amd64]
     hooks:
       post:
-        - cmd: ./script/sign-windows-executable.sh {{ .Path }}
-          env:
-            - GITHUB_CERT_PASSWORD={{ .Env.GITHUB_CERT_PASSWORD }}
-            - DESKTOP_CERT_TOKEN={{ .Env.DESKTOP_CERT_TOKEN }}
+        - ./script/sign-windows-executable.sh {{ .Path }}
 
 archives:
   - id: nix
